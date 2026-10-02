@@ -35,3 +35,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of panicking the decoder.
 - SlateDB compaction skips a stored batch it cannot inflate, with a warning,
   instead of abandoning the whole maintenance pass.
+- Fetch answers `OFFSET_OUT_OF_RANGE` for a fetch offset below the partition's log start offset or above its high watermark, instead of passing the offset to storage. A Fetch with a partition error is answered immediately rather than after `max_wait`.
