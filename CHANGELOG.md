@@ -35,3 +35,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of panicking the decoder.
 - SlateDB compaction skips a stored batch it cannot inflate, with a warning,
   instead of abandoning the whole maintenance pass.
+- ListOffsets reads each partition from storage separately, up to 4 at once, and answers a partition still unread after 5 seconds with `REQUEST_TIMED_OUT`, which clients retry. A slow partition no longer delays the others or holds the request past the client's timeout.
