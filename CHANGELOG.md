@@ -35,4 +35,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of panicking the decoder.
 - SlateDB compaction skips a stored batch it cannot inflate, with a warning,
   instead of abandoning the whole maintenance pass.
-- An `acks=0` Produce request no longer waits for a response that was never coming: the broker now suppresses the response instead of writing one. A storage or validation failure on an `acks=0` Produce now closes the connection (matching Apache Kafka) instead of silently dropping the batch.
+- The broker no longer writes a Produce response for an `acks=0` request. A storage or validation failure on an `acks=0` Produce now closes the connection (matching Apache Kafka) instead of silently dropping the batch.
