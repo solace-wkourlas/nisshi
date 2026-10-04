@@ -455,6 +455,23 @@ where
                                     // not an anomaly worth an `error!` on every occurrence.
                                     || io.kind() == ErrorKind::TimedOut => {}
 
+                            // An acks=0 producer that hits an unknown topic or sends a
+                            // malformed batch is routine client-input, not a server-side
+                            // problem: real Kafka itself logs this case at `info` level
+                            // ("Closing connection due to error during produce request...").
+                            Err(Error::Storage(nisshi_storage::Error::AcksZeroProduceFailed {
+                                ref topic,
+                                partition,
+                                error_code,
+                            })) => {
+                                info!(
+                                    topic,
+                                    partition,
+                                    ?error_code,
+                                    "closing connection: acks=0 produce failed"
+                                );
+                            }
+
                             Err(error) => {
                                 error!(?error);
                             },
