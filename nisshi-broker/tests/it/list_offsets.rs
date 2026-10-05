@@ -556,10 +556,9 @@ pub async fn new_topic<G>(
     broker_id: i32,
     sc: G,
     // The correct answer for a Timestamp lookup against an empty partition
-    // is "not found" (`None`), matched today only by backends SOL-155076 et
-    // al have fixed; the rest still fall back to a shared, pre-existing
-    // `Some(0)` default this parametrizes rather than papers over. See
-    // SOL-155076/SOL-155073.
+    // is "not found" (`None`). Only some backends return that; the rest
+    // still return a shared `Some(0)` default, so this parametrizes the
+    // difference instead of hiding it (SOL-155076, SOL-155073).
     timestamp_no_match_offset: Option<i64>,
 ) -> Result<()>
 where
