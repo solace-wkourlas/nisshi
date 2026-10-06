@@ -200,14 +200,14 @@ async fn create_delete_create_by_name(storage: impl Storage + Clone) -> Result<(
     Ok(())
 }
 
-/// A DeleteTopics request naming a topic whose name fails Kafka's topic-name
-/// rule must reject only that name with INVALID_TOPIC_EXCEPTION, and must
-/// never touch a topic that was not named. On dynostore, `Path::from`
-/// collapses an empty path segment, so an empty name, or a name with a
-/// leading, trailing, or doubled "/", widens the delete's key prefix: an
-/// empty name's prefix matches every topic's own data, and a trailing "/"
-/// makes the second pass (deleting a topic's consumer-group offsets) match
-/// another topic's offsets instead of its own.
+/// Deleting a topic whose name is not a safe object key prefix (empty, or
+/// containing "/") must remove the topic, by name or by id, and must never
+/// touch a topic that was not named. On dynostore, `Path::from` collapses an
+/// empty path segment, so an empty name, or a name with a leading, trailing,
+/// or doubled "/", widens the delete's key prefix: an empty name's prefix
+/// matches every topic's own data, and a trailing "/" makes the second pass
+/// (deleting a topic's consumer-group offsets) match another topic's offsets
+/// instead of its own.
 async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<(), Error> {
     let good_name = alphanumeric_string(15);
     let empty_name = String::new();
@@ -220,13 +220,15 @@ async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<
     // (object_store drops the empty segment the trailing "/" leaves before
     // "/partitions/..."), so creating it after producing to good_name would
     // reset good_name's watermark back to none.
+    let mut empty_id = None;
+
     for name in [
         good_name.clone(),
         empty_name.clone(),
         trailing_slash_name.clone(),
         doomed_name.clone(),
     ] {
-        _ = storage
+        let id = storage
             .create_topic(
                 CreatableTopic::default()
                     .name(name.clone())
@@ -237,7 +239,13 @@ async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<
                 false,
             )
             .await?;
+
+        if name.is_empty() {
+            empty_id = Some(id);
+        }
     }
+
+    let empty_id = empty_id.expect("empty_name was created");
 
     // trailing_slash_name is never produced to: producing would land on
     // good_name's own object path for the same reason, and collide with it.
@@ -274,53 +282,49 @@ async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<
         storage: storage.clone(),
     };
 
-    let response = delete_topics
-        .serve(RequestInput {
-            request: DeleteTopicsRequest::default().topic_names(Some(vec![
-                empty_name.clone(),
-                trailing_slash_name.clone(),
-                doomed_name.clone(),
-            ])),
-            extensions: Extensions::default(),
-        })
-        .await?;
+    // A Java client refuses an empty name before sending, so a delete by id
+    // is the only way that topic reaches the broker.
+    let by_id = |id: Uuid| {
+        DeleteTopicsRequest::default().topics(Some(vec![
+            DeleteTopicState::default().topic_id(id.into_bytes()),
+        ]))
+    };
+    let by_name = || {
+        DeleteTopicsRequest::default()
+            .topic_names(Some(vec![trailing_slash_name.clone(), doomed_name.clone()]))
+    };
 
-    let responses = response.responses.unwrap_or_default();
-    assert_eq!(3, responses.len());
+    for (request, expected) in [
+        (by_id(empty_id), ErrorCode::None),
+        (by_name(), ErrorCode::None),
+        // Every topic is gone: a second delete finds nothing.
+        (by_id(empty_id), ErrorCode::UnknownTopicOrPartition),
+        (by_name(), ErrorCode::UnknownTopicOrPartition),
+    ] {
+        let response = delete_topics
+            .serve(RequestInput {
+                request,
+                extensions: Extensions::default(),
+            })
+            .await?;
 
-    let empty_result = responses
-        .iter()
-        .find(|result| result.name.as_deref() == Some(empty_name.as_str()))
-        .expect("missing result for the empty topic name");
-    assert_eq!(
-        ErrorCode::InvalidTopicException,
-        ErrorCode::try_from(empty_result.error_code)?
-    );
-
-    let trailing_slash_result = responses
-        .iter()
-        .find(|result| result.name.as_deref() == Some(trailing_slash_name.as_str()))
-        .expect("missing result for the trailing-slash topic name");
-    assert_eq!(
-        ErrorCode::InvalidTopicException,
-        ErrorCode::try_from(trailing_slash_result.error_code)?
-    );
-
-    let doomed_result = responses
-        .iter()
-        .find(|result| result.name.as_deref() == Some(doomed_name.as_str()))
-        .expect("missing result for doomed_name");
-    assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(doomed_result.error_code)?
-    );
+        for result in response.responses.unwrap_or_default() {
+            assert_eq!(
+                expected,
+                ErrorCode::try_from(result.error_code)?,
+                "name = {:?}, topic_id = {:?}",
+                result.name,
+                result.topic_id
+            );
+        }
+    }
 
     let min_bytes = 1;
     let max_bytes = 50 * 1024;
     let isolation = IsolationLevel::ReadUncommitted;
     let max_wait = Duration::from_millis(500);
 
-    // good_name was never named in the request, so its data and committed
+    // good_name was never named in a request, so its data and committed
     // offset must still be there, exactly as produced/committed above.
     let good_fetch = storage
         .fetch(&good_topition, 0, min_bytes, max_bytes, isolation, max_wait)
@@ -335,21 +339,6 @@ async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<
         )
         .await?;
     assert_eq!(Some(&offset), offset_fetch.get(&good_topition));
-
-    // empty_name was rejected before anything was deleted, so its own data
-    // must still be there too.
-    let empty_topition = Topition::new(empty_name.as_str(), 0);
-    let empty_fetch = storage
-        .fetch(
-            &empty_topition,
-            0,
-            min_bytes,
-            max_bytes,
-            isolation,
-            max_wait,
-        )
-        .await?;
-    assert!(!empty_fetch.is_empty());
 
     Ok(())
 }

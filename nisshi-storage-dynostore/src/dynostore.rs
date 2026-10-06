@@ -525,23 +525,6 @@ impl DynoStore {
     }
 }
 
-/// Returns whether `name` is a legal Kafka topic name: 1 to 249 characters
-/// from `[a-zA-Z0-9._-]`, and not `.` or `..`.
-///
-/// Must stay equal to `nisshi_storage`'s private copy of this rule, which
-/// this crate cannot import directly.
-// TODO(SOL-155175): replace with nisshi_sans_io::topic::is_valid_topic_name
-// once it exists.
-fn is_valid_topic_name(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && name.len() <= 249
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
-}
-
 #[async_trait]
 impl Storage for DynoStore {
     async fn register_broker(&self, _broker_registration: BrokerRegistrationRequest) -> Result<()> {
@@ -658,31 +641,36 @@ impl Storage for DynoStore {
 
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
         if let Some(metadata) = self.topic_metadata(topic).await? {
-            // Validate the name storage resolved via `topic_metadata`, not
-            // the input `topic: &TopicId`: a delete by `TopicId::Id(uuid)`
-            // carries no name at all until this lookup resolves it, so
-            // checking the input instead would skip this guard for every
-            // delete-by-id.
-            if !is_valid_topic_name(&metadata.topic.name) {
-                // The prefix below is built directly from this name, and
-                // object_store collapses empty segments and treats "/" as a
-                // path separator. Deleting by that prefix for an empty name
-                // would delete every topic's objects; for a name containing
-                // "/" it would delete a sibling topic's objects. Refuse
-                // instead of risking either.
-                warn!(
-                    name = metadata.topic.name.as_str(),
-                    "refusing to delete a topic with an invalid name"
-                );
-                return Ok(ErrorCode::InvalidTopicException);
-            }
-
             self.meta
                 .with_mut(&self.object_store, |meta| {
                     _ = meta.topics.remove(metadata.topic.name.as_str());
                     Ok(())
                 })
                 .await?;
+
+            // Both sweeps below delete by a key prefix built from the name,
+            // and `Path::from` treats "/" as a separator and drops empty
+            // segments. For an empty name, or one containing "/", the prefix
+            // widens to cover every topic's data or a sibling topic's data
+            // and offsets. Such a name can only predate CreateTopics' name
+            // check. Remove its metadata entry so the topic is gone through
+            // the Kafka API, and leave its objects in place rather than risk
+            // deleting another topic's. Names with other invalid characters
+            // (a space, non-ASCII) are percent-encoded into a single path
+            // segment, so they are swept as usual.
+            //
+            // The resolved name is checked, not the request's, because a
+            // delete by id carries no name until `topic_metadata` resolves it.
+            if metadata.topic.name.is_empty() || metadata.topic.name.contains('/') {
+                warn!(
+                    name = metadata.topic.name.as_str(),
+                    topic_id = %metadata.id,
+                    prefix = format!("clusters/{}/topics/{}/", self.cluster, metadata.topic.name),
+                    "deleted topic metadata only: its name is not a safe object key prefix, \
+                     so its data and committed offsets were left in place"
+                );
+                return Ok(ErrorCode::None);
+            }
 
             let prefix = Path::from(format!(
                 "clusters/{}/topics/{}/",

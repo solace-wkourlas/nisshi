@@ -35,3 +35,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of panicking the decoder.
 - SlateDB compaction skips a stored batch it cannot inflate, with a warning,
   instead of abandoning the whole maintenance pass.
+- DeleteTopics on the S3 and in-memory backends no longer deletes other topics' data or committed offsets when the deleted topic's name is empty or contains `/`. Such a topic is removed from metadata and the request answers `NONE`, but its objects under `clusters/<cluster>/topics/<name>/` are left in place and logged at `warn` with the topic id, for an operator to remove by hand.
