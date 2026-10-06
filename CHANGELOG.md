@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The proxy forwards a batched Produce (`tansu.batch=true`) with the strictest `acks` among the batched requests, and at least `acks=1`, so the origin answers it. Upgrade proxies before brokers: an older proxy forwards batches with `acks=0` and waits for a response that an upgraded broker no longer sends.
+- Known limitation: the proxy still waits for a response to an `acks=0` Produce that it passes through unbatched. Against an upgraded broker, that request stalls until the broker's connection idle timeout closes the upstream connection.
 - A listener with SASL configured closes a connection that sends a frame larger than 512KiB before the client authenticates, matching the Apache Kafka default for `sasl.server.max.receive.size`. The same limit applies while a client re-authenticates. The broker logs this rejection as `PreAuthenticationFrameTooBig`, and counts it in `nisshi_frames_rejected`.
 
 ### Security
