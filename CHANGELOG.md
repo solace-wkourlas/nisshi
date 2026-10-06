@@ -35,16 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of panicking the decoder.
 - SlateDB compaction skips a stored batch it cannot inflate, with a warning,
   instead of abandoning the whole maintenance pass.
-- `DeleteGroups` refuses a group that still has members or a rebalance in
-  progress with `NON_EMPTY_GROUP` (68), instead of deleting its state and
-  committed offsets out from under a live consumer. The check runs through
-  the group coordinator rather than storage alone, so a member whose
-  session has expired (no `LeaveGroup` ever sent) is still correctly
-  evicted first and the group remains deletable once genuinely empty; a
-  group actually deleted has its coordinator-cached state forgotten too,
-  so a new member joining under the same, just-freed group name starts a
-  real new group instead of reusing stale state. `DescribeGroups` and
-  `DeleteGroups` on the PostgreSQL and libSQL (including Turso) storage
-  engines no longer error for a group that only ever committed offsets and
-  never ran `JoinGroup` (a group row with no detail row); that case is now
-  correctly reported as an empty group.
+- `DeleteGroups` refuses a group that still has members with
+  `NON_EMPTY_GROUP` (68), instead of deleting its state and committed
+  offsets out from under a live consumer. A member whose session has
+  expired does not count. The broker decides from stored group state, so a
+  member connected through another broker counts too, and a group whose
+  state the broker cannot read is not deleted. Only the broker that served
+  the request forgets its cached state for the deleted group; another
+  broker that cached the group can still write it back. A group named more
+  than once in one request is processed once.
+- `DescribeGroups` and `DeleteGroups` on the PostgreSQL and libSQL
+  (including Turso) storage engines report a group that only ever
+  committed offsets, and never ran `JoinGroup`, as an empty group instead
+  of failing.
