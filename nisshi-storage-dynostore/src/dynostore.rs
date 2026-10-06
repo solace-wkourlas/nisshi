@@ -774,7 +774,7 @@ impl Storage for DynoStore {
                 .try_collect::<Vec<Path>>()
                 .await?;
 
-            let prefix = Path::from(format!("clusters/{}/groups/consumers/", self.cluster));
+            let prefix = self.group_consumers_prefix();
 
             let topic_name = metadata.topic.name.clone();
             let prefix_clone = prefix.clone();
@@ -1522,20 +1522,22 @@ impl Storage for DynoStore {
                 .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
             {
                 debug!(?meta);
-                let Some(topic): Option<String> = meta
-                    .location
-                    .parts()
-                    .nth(6)
+
+                // Below the offsets prefix: `{topic}/partitions/{partition:0>10}.json`.
+                let Some(mut parts) = meta.location.prefix_match(&location) else {
+                    continue;
+                };
+
+                let Some(topic): Option<String> = parts
+                    .next()
                     .inspect(|topic| debug!(?topic))
                     .map(|topic| topic.as_ref().into())
                 else {
                     continue;
                 };
 
-                let Some(partition) = meta
-                    .location
-                    .parts()
-                    .nth(8)
+                let Some(partition) = parts
+                    .nth(1)
                     .inspect(|partition| debug!(?partition))
                     .map(|partition| i32::from_str(&partition.as_ref()[0..10]))
                     .transpose()?
@@ -1930,7 +1932,7 @@ impl Storage for DynoStore {
     }
 
     async fn list_groups(&self, _states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        let location = Path::from(format!("clusters/{}/groups/consumers/", self.cluster,));
+        let location = self.group_consumers_prefix();
         let list_result = self
             .object_store
             .list_with_delimiter(Some(&location))

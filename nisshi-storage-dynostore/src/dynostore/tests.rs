@@ -13,14 +13,17 @@
 // limitations under the License.
 
 use dotenv::dotenv;
-use nisshi_storage::{Error, Result};
-use object_store::path::PathPart;
+use nisshi_storage::{Error, Result, Topition};
+use object_store::{
+    memory::InMemory,
+    path::{Path, PathPart},
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs::File, sync::Arc, thread};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 
-use super::{EMPTY_GROUP_SENTINEL, decode_group_segment, group_path_part};
+use super::{DynoStore, EMPTY_GROUP_SENTINEL, decode_group_segment, group_path_part};
 
 mod latency;
 
@@ -123,7 +126,9 @@ fn literal_percent_empty_group_id_does_not_collide_with_sentinel() {
 
 #[test]
 fn group_path_part_round_trips_through_decode_group_segment() {
-    for group_id in ["", "a", "a/b", "/", "//", "a/", "%empty", ".", ".."] {
+    for group_id in [
+        "", "a", "a/b", "/", "//", "a/", "%empty", ".", "..", "a#b", "café",
+    ] {
         let encoded = group_path_part(group_id);
         let decoded = decode_group_segment(encoded.as_ref()).expect("encoded segment must decode");
         assert_eq!(group_id, decoded, "round trip failed for {group_id:?}");
@@ -132,7 +137,9 @@ fn group_path_part_round_trips_through_decode_group_segment() {
 
 #[test]
 fn group_path_part_gives_every_id_a_distinct_segment() {
-    let ids = ["", "a", "/", "//", "a/", "%empty", ".", ".."];
+    let ids = [
+        "", "a", "a/b", "/", "//", "a/", "%empty", ".", "..", "a#b", "café",
+    ];
 
     for (i, a) in ids.iter().enumerate() {
         for (j, b) in ids.iter().enumerate() {
@@ -146,4 +153,38 @@ fn group_path_part_gives_every_id_a_distinct_segment() {
 fn decode_group_segment_rejects_invalid_utf8() {
     // 0x80 alone is not valid UTF-8, and is not the percent-encoded sentinel.
     assert_eq!(None, decode_group_segment("%80"));
+}
+
+/// Existing data is stored under these keys and is not migrated, so a group
+/// id without a `/` (other than `.` and `..`, whose state file moved) must
+/// keep the exact key it had when keys were built with
+/// `Path::from(format!(..))` from these templates.
+#[test]
+fn group_keys_are_stable_for_ids_without_a_slash() {
+    let storage = DynoStore::new("c", 111, InMemory::new());
+    let topition = Topition::new("t", 3);
+
+    assert_eq!(
+        "clusters/c/groups/consumers/grp/offsets/t/partitions/0000000003.json",
+        storage.committed_offset_location("grp", &topition).as_ref()
+    );
+    assert_eq!(
+        "clusters/c/groups/consumers/grp.json",
+        storage.group_state_location("grp").as_ref()
+    );
+
+    for group_id in ["grp", "a#b", "a%b", "a b", "café", "%empty"] {
+        assert_eq!(
+            Path::from(format!(
+                "clusters/c/groups/consumers/{group_id}/offsets/t/partitions/0000000003.json"
+            )),
+            storage.committed_offset_location(group_id, &topition),
+            "committed offset key moved for {group_id:?}"
+        );
+        assert_eq!(
+            Path::from(format!("clusters/c/groups/consumers/{group_id}.json")),
+            storage.group_state_location(group_id),
+            "group state key moved for {group_id:?}"
+        );
+    }
 }
