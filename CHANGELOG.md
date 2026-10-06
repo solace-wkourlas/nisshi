@@ -36,3 +36,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SlateDB compaction skips a stored batch it cannot inflate, with a warning,
   instead of abandoning the whole maintenance pass.
 - Fetch: a partition whose storage read does not finish in time no longer holds the whole request until the client gives up. Each partition gets a share of a per-request read deadline (`max_wait` plus 5 seconds), so the partitions after a slow one are still read instead of starving on every retry.
+  A partition that runs out of time answers with no error and no records, and with -1 as its high watermark, last stable offset and log start offset, unless it returned records first. librdkafka and franz-go then report -1 watermarks and lag for that partition until the next full answer. The broker logs `fetch read deadline exceeded` for it and counts it in `nisshi_storage_read_deadline_exceeded`.
