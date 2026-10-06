@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A consumer whose position is below a partition's log start offset now applies `auto.offset.reset`, as with Apache Kafka: Fetch answers `OFFSET_OUT_OF_RANGE` straight away, where it used to return the earliest surviving record. This shows on slatedb after retention or DeleteRecords: with the default `latest`, the consumer skips the retained backlog, and with `none`, the application gets an exception. Before you upgrade, compare consumer positions with the log start offset.
 - A listener with SASL configured closes a connection that sends a frame larger than 512KiB before the client authenticates, matching the Apache Kafka default for `sasl.server.max.receive.size`. The same limit applies while a client re-authenticates. The broker logs this rejection as `PreAuthenticationFrameTooBig`, and counts it in `nisshi_frames_rejected`.
 
 ### Security
@@ -35,5 +36,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of panicking the decoder.
 - SlateDB compaction skips a stored batch it cannot inflate, with a warning,
   instead of abandoning the whole maintenance pass.
-- Fetch answers `OFFSET_OUT_OF_RANGE` for a fetch offset below the partition's log start offset or above its high watermark, instead of passing the offset to storage. A Fetch with a partition error is answered immediately rather than after `max_wait`.
-- Fetch no longer sends a leader hint with `UNKNOWN_TOPIC_OR_PARTITION` for an unknown topic id. Kafka sends one only with a leadership error, and librdkafka's consumer close hung or crashed on a deleted topic once that response came back without waiting.
+- Fetch checks the fetch offset before it reaches the storage engine. Above the high watermark, Fetch answers `NONE` with no records, as Apache Kafka does, so a storage engine never receives an offset such as `i64::MAX`.
+- Fetch no longer sends a `current_leader` hint with `UNKNOWN_TOPIC_OR_PARTITION`, as in Apache Kafka.
