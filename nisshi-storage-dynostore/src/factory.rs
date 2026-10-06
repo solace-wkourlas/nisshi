@@ -20,7 +20,7 @@ use nisshi_storage::{
     ArcDynStorage, ProduceRequestBatcher, Result, StorageFactory, StorageFactoryConfiguration,
 };
 use object_store::{
-    aws::{AmazonS3Builder, S3ConditionalPut},
+    aws::{AmazonS3Builder, AmazonS3ConfigKey, S3ConditionalPut},
     gcp::GoogleCloudStorageBuilder,
     memory::InMemory,
 };
@@ -93,25 +93,31 @@ impl StorageFactory for S3OptimisticConcurrencyEngineFactory {
 
         debug!(?minimum_size, ?maximum_delay);
 
-        let object_store = AmazonS3Builder::from_env()
+        let builder = AmazonS3Builder::from_env()
             .with_bucket_name(bucket_name)
-            .with_conditional_put(S3ConditionalPut::ETagMatch)
-            .build()
-            .map_err(nisshi_storage::Error::from)?;
+            .with_conditional_put(S3ConditionalPut::ETagMatch);
 
-        // Resolve AWS credentials now, before any request is attempted. A failure
-        // here is unambiguous: no credential source (static keys, web identity, a
-        // task role, or finally the EC2 instance metadata service or the ECS task
-        // credential endpoint) could be resolved at all, as distinct from a later
-        // request failure (wrong bucket, wrong endpoint, credentials that resolved
-        // but are wrong, ...).
-        // `object_store` caches the resolved credential, so the `ping()` startup
-        // check that follows doesn't pay a second IMDS round trip for this.
-        let _ = object_store
-            .credentials()
-            .get_credential()
-            .await
-            .map_err(|source| nisshi_storage::Error::NoCredentials(Arc::new(source)))?;
+        // With `AWS_SKIP_SIGNATURE=true`, object_store sends unsigned requests
+        // and never asks the credential provider for a credential. The provider
+        // still exists and, with no keys set, falls back to the instance
+        // metadata service, so this check would fail a setup that works.
+        let skip_signature = builder
+            .get_config_value(&AmazonS3ConfigKey::SkipSignature)
+            .is_some_and(|value| value == "true");
+
+        let object_store = builder.build().map_err(nisshi_storage::Error::from)?;
+
+        // We get a credential from the configured provider now, so that a
+        // provider failure is reported as `NoCredentials` and not as a failed
+        // request. The provider caches the credential, so the `ping()` startup
+        // check that follows does not fetch it again.
+        if !skip_signature {
+            let _ = object_store
+                .credentials()
+                .get_credential()
+                .await
+                .map_err(|source| nisshi_storage::Error::NoCredentials(Arc::new(source)))?;
+        }
 
         let storage = DynoStore::new(
             configuration.cluster.as_str(),
