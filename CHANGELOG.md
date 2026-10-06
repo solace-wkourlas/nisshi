@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- On S3 and memory storage, `ListOffsets` by timestamp (a consumer's
+  `offsetsForTimes`) answers the first record whose own timestamp is at or
+  after the target, instead of using the time each batch was stored. A
+  consumer that seeks by time can land on a different offset after
+  upgrading. The first such lookup on each existing partition reads every
+  stored batch of that partition once, to build its time index.
 - A Snappy batch with a truncated xerial header is rejected with an error
   instead of panicking the decoder.
 - SlateDB compaction skips a stored batch it cannot inflate, with a warning,
