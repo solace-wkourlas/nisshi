@@ -27,9 +27,10 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use deadpool::managed;
 use deadpool_postgres::{
-    Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod, Runtime, TimeoutType,
-    Transaction,
+    ClientWrapper, Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod, Runtime,
+    TimeoutType, Transaction,
 };
 use futures::pin_mut;
 use futures_util::future;
@@ -71,12 +72,14 @@ use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
 use rand::{prelude::*, rng};
 use serde_json::Value;
+use tokio::runtime::Handle;
 use tokio_postgres::{
     Config, Row, RowStream,
     binary_copy::BinaryCopyInWriter,
     error::SqlState,
     types::{BorrowToSql, ToSql, Type},
 };
+use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{debug, error, instrument};
 use url::Url;
 use uuid::Uuid;
@@ -92,6 +95,7 @@ pub struct Postgres {
     node: i32,
     advertised_listener: Url,
     pool: Pool,
+    cancel_tls: Option<CancelTls>,
     schemas: Option<Registry>,
     lake: Option<House>,
 }
@@ -103,6 +107,7 @@ pub struct Builder<C, N, L, P> {
     node: N,
     advertised_listener: L,
     pool: P,
+    cancel_tls: Option<CancelTls>,
     schemas: Option<Registry>,
     lake: Option<House>,
 }
@@ -114,6 +119,7 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             node: self.node,
             advertised_listener: self.advertised_listener,
             pool: self.pool,
+            cancel_tls: self.cancel_tls,
             schemas: self.schemas,
             lake: self.lake,
         }
@@ -125,6 +131,7 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             node,
             advertised_listener: self.advertised_listener,
             pool: self.pool,
+            cancel_tls: self.cancel_tls,
             schemas: self.schemas,
             lake: self.lake,
         }
@@ -136,6 +143,7 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             node: self.node,
             advertised_listener,
             pool: self.pool,
+            cancel_tls: self.cancel_tls,
             schemas: self.schemas,
             lake: self.lake,
         }
@@ -157,6 +165,7 @@ impl Builder<String, i32, Url, Pool> {
             node: self.node,
             advertised_listener: self.advertised_listener,
             pool: self.pool,
+            cancel_tls: self.cancel_tls,
             schemas: self.schemas,
             lake: self.lake,
         }
@@ -230,7 +239,8 @@ where
         .map(|config| config.with_root_certificates(root_store))
         .map(|config| config.with_no_client_auth())?;
 
-        let tls = tokio_postgres_rustls::MakeRustlsConnect::new(config);
+        let tls = MakeRustlsConnect::new(config);
+        let cancel_tls = Some(CancelTls(tls.clone()));
 
         let mgr = Manager::from_config(pg_config, tls, mgr_config);
         let advertised_listener = Url::parse("tcp://127.0.0.1/")?;
@@ -243,6 +253,7 @@ where
             .build()
             .map(|pool| Self {
                 pool,
+                cancel_tls,
                 advertised_listener,
                 node: N::default(),
                 cluster: C::default(),
@@ -250,6 +261,83 @@ where
                 lake: None,
             })
             .map_err(Into::into)
+    }
+}
+
+/// The TLS connector that sends a cancel request for a statement on its own
+/// connection to the server.
+#[derive(Clone)]
+struct CancelTls(MakeRustlsConnect);
+
+impl Debug for CancelTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("CancelTls").finish_non_exhaustive()
+    }
+}
+
+/// A pooled object that goes back to its pool only through
+/// [`Abandonable::release`].
+///
+/// The pool recycles a connection after checking only that it is open
+/// ([`RecyclingMethod::Fast`]). A connection dropped while a statement runs
+/// on the server would go back to the pool still busy, and the next caller
+/// would wait behind that statement. Dropping this guard instead takes the
+/// object out of the pool and passes it to `abandon`, so the pool replaces
+/// it with a fresh one.
+struct Abandonable<M, F>
+where
+    M: managed::Manager,
+    F: FnOnce(M::Type),
+{
+    object: Option<managed::Object<M>>,
+    abandon: Option<F>,
+}
+
+impl<M, F> Abandonable<M, F>
+where
+    M: managed::Manager,
+    F: FnOnce(M::Type),
+{
+    fn new(object: managed::Object<M>, abandon: F) -> Self {
+        Self {
+            object: Some(object),
+            abandon: Some(abandon),
+        }
+    }
+
+    fn object(&self) -> &managed::Object<M> {
+        self.object
+            .as_ref()
+            .expect("an abandonable object is held until release or drop")
+    }
+
+    /// Returns the object to its pool, once its work has finished.
+    fn release(mut self) {
+        drop(self.object.take());
+    }
+}
+
+impl<M, F> Drop for Abandonable<M, F>
+where
+    M: managed::Manager,
+    F: FnOnce(M::Type),
+{
+    fn drop(&mut self) {
+        if let (Some(object), Some(abandon)) = (self.object.take(), self.abandon.take()) {
+            abandon(managed::Object::take(object));
+        }
+    }
+}
+
+impl<M, F> Debug for Abandonable<M, F>
+where
+    M: managed::Manager,
+    F: FnOnce(M::Type),
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Abandonable")
+            .field("held", &self.object.is_some())
+            .finish()
     }
 }
 
@@ -318,6 +406,130 @@ impl Postgres {
                 }
             })
             .map_err(Into::into)
+    }
+
+    /// Checks out a connection for a read that a caller may drop mid-statement.
+    ///
+    /// Dropping the guard before [`Abandonable::release`] closes the
+    /// connection and asks the server to cancel its statement, so the
+    /// statement stops instead of running until `statement_timeout`.
+    async fn abandonable_connection(
+        &self,
+    ) -> Result<Abandonable<Manager, impl FnOnce(ClientWrapper) + use<>>> {
+        let cancel_tls = self.cancel_tls.clone();
+
+        self.connection().await.map(|connection| {
+            Abandonable::new(connection, move |client: ClientWrapper| {
+                let token = client.cancel_token();
+                drop(client);
+
+                if let (Some(CancelTls(tls)), Ok(runtime)) = (cancel_tls, Handle::try_current()) {
+                    _ = runtime.spawn(async move {
+                        if let Err(err) = token.cancel_query(tls).await {
+                            debug!(?err, "cancel an abandoned statement");
+                        }
+                    });
+                }
+            })
+        })
+    }
+
+    /// Reads `offsets` one statement at a time on `c`.
+    async fn list_offsets_on(
+        &self,
+        c: &Object,
+        isolation_level: IsolationLevel,
+        offsets: &[(Topition, ListOffset)],
+    ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
+        let mut responses = vec![];
+
+        for (topition, offset_type) in offsets {
+            let query = match (offset_type, isolation_level) {
+                (ListOffset::Earliest, _) => "list_earliest_offset.sql",
+                (ListOffset::Latest, IsolationLevel::ReadCommitted) => {
+                    "list_latest_offset_committed.sql"
+                }
+                (ListOffset::Latest, IsolationLevel::ReadUncommitted) => {
+                    "list_latest_offset_uncommitted.sql"
+                }
+                (ListOffset::Timestamp(_), _) => "list_latest_offset_timestamp.sql",
+            };
+
+            debug!(?query);
+
+            let list_offset = match offset_type {
+                ListOffset::Earliest | ListOffset::Latest => self
+                    .prepare_query_opt(
+                        c,
+                        query,
+                        &[&self.cluster, &topition.topic(), &topition.partition()],
+                    )
+                    .await
+                    .inspect_err(|err| error!(?err, cluster = self.cluster, ?topition)),
+
+                ListOffset::Timestamp(timestamp) => self
+                    .prepare_query_opt(
+                        c,
+                        query,
+                        &[
+                            &self.cluster.as_str(),
+                            &topition.topic(),
+                            &topition.partition(),
+                            timestamp,
+                        ],
+                    )
+                    .await
+                    .inspect_err(|err| error!(?err)),
+            }
+            .inspect_err(|err| {
+                error!(?err, cluster = self.cluster, ?topition);
+            })
+            .inspect(|result| debug!(?result))?
+            .map_or_else(
+                || {
+                    let timestamp = None;
+                    let offset = Some(0);
+                    debug!(
+                        cluster = self.cluster,
+                        ?topition,
+                        ?offset_type,
+                        offset,
+                        ?timestamp
+                    );
+
+                    Ok(ListOffsetResponse {
+                        timestamp,
+                        offset,
+                        ..Default::default()
+                    })
+                },
+                |row| {
+                    debug!(?row);
+
+                    row.try_get::<_, i64>(0).map(Some).and_then(|offset| {
+                        row.try_get::<_, SystemTime>(1).map(Some).map(|timestamp| {
+                            debug!(
+                                cluster = self.cluster,
+                                ?topition,
+                                ?offset_type,
+                                offset,
+                                ?timestamp
+                            );
+
+                            ListOffsetResponse {
+                                timestamp,
+                                offset,
+                                ..Default::default()
+                            }
+                        })
+                    })
+                },
+            )?;
+
+            responses.push((topition.clone(), list_offset));
+        }
+
+        Ok(responses)
     }
 
     fn sql_lookup(&self, key: &str) -> Result<&str> {
@@ -2689,97 +2901,13 @@ impl Storage for Postgres {
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
         debug!(cluster = self.cluster, ?isolation_level, ?offsets);
 
-        let c = self.connection().await?;
+        let connection = self.abandonable_connection().await?;
+        let responses = self
+            .list_offsets_on(connection.object(), isolation_level, offsets)
+            .await;
+        connection.release();
 
-        let mut responses = vec![];
-
-        for (topition, offset_type) in offsets {
-            let query = match (offset_type, isolation_level) {
-                (ListOffset::Earliest, _) => "list_earliest_offset.sql",
-                (ListOffset::Latest, IsolationLevel::ReadCommitted) => {
-                    "list_latest_offset_committed.sql"
-                }
-                (ListOffset::Latest, IsolationLevel::ReadUncommitted) => {
-                    "list_latest_offset_uncommitted.sql"
-                }
-                (ListOffset::Timestamp(_), _) => "list_latest_offset_timestamp.sql",
-            };
-
-            debug!(?query);
-
-            let list_offset = match offset_type {
-                ListOffset::Earliest | ListOffset::Latest => self
-                    .prepare_query_opt(
-                        &c,
-                        query,
-                        &[&self.cluster, &topition.topic(), &topition.partition()],
-                    )
-                    .await
-                    .inspect_err(|err| error!(?err, cluster = self.cluster, ?topition)),
-
-                ListOffset::Timestamp(timestamp) => self
-                    .prepare_query_opt(
-                        &c,
-                        query,
-                        &[
-                            &self.cluster.as_str(),
-                            &topition.topic(),
-                            &topition.partition(),
-                            timestamp,
-                        ],
-                    )
-                    .await
-                    .inspect_err(|err| error!(?err)),
-            }
-            .inspect_err(|err| {
-                error!(?err, cluster = self.cluster, ?topition);
-            })
-            .inspect(|result| debug!(?result))?
-            .map_or_else(
-                || {
-                    let timestamp = None;
-                    let offset = Some(0);
-                    debug!(
-                        cluster = self.cluster,
-                        ?topition,
-                        ?offset_type,
-                        offset,
-                        ?timestamp
-                    );
-
-                    Ok(ListOffsetResponse {
-                        timestamp,
-                        offset,
-                        ..Default::default()
-                    })
-                },
-                |row| {
-                    debug!(?row);
-
-                    row.try_get::<_, i64>(0).map(Some).and_then(|offset| {
-                        row.try_get::<_, SystemTime>(1).map(Some).map(|timestamp| {
-                            debug!(
-                                cluster = self.cluster,
-                                ?topition,
-                                ?offset_type,
-                                offset,
-                                ?timestamp
-                            );
-
-                            ListOffsetResponse {
-                                timestamp,
-                                offset,
-                                ..Default::default()
-                            }
-                        })
-                    })
-                },
-            )?;
-
-            responses.push((topition.clone(), list_offset));
-        }
-
-        Ok(responses).inspect(|r| debug!(?r))
+        responses.inspect(|r| debug!(?r))
     }
 
     #[instrument(skip_all)]
@@ -4185,6 +4313,72 @@ mod tests {
         let timeouts = builder.pool.timeouts();
         assert_eq!(timeouts.wait, Some(DEFAULT_POOL_WAIT_TIMEOUT));
         assert_eq!(timeouts.create, Some(DEFAULT_POOL_CREATE_TIMEOUT));
+
+        Ok(())
+    }
+
+    /// Hands out numbered objects, so a test can tell a fresh object from a
+    /// recycled one.
+    #[derive(Debug, Default)]
+    struct Numbered(std::sync::atomic::AtomicU32);
+
+    impl managed::Manager for Numbered {
+        type Type = u32;
+        type Error = std::convert::Infallible;
+
+        async fn create(&self) -> std::result::Result<u32, Self::Error> {
+            Ok(self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+        }
+
+        async fn recycle(
+            &self,
+            _object: &mut u32,
+            _metrics: &managed::Metrics,
+        ) -> managed::RecycleResult<Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// A released object goes back to the pool. A dropped one leaves the
+    /// pool, reaches `abandon`, and the pool's next checkout creates a fresh
+    /// object instead of handing it out again.
+    #[tokio::test]
+    async fn abandoned_object_leaves_the_pool() -> Result<()> {
+        let pool = managed::Pool::<Numbered>::builder(Numbered::default())
+            .max_size(1)
+            .build()
+            .map_err(|err| Error::Message(err.to_string()))?;
+
+        let abandoned = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let get = async || {
+            let abandoned = abandoned.clone();
+            pool.get()
+                .await
+                .map(|object| {
+                    Abandonable::new(object, move |object| {
+                        abandoned.lock().expect("abandoned").push(object)
+                    })
+                })
+                .map_err(|err| Error::Message(err.to_string()))
+        };
+
+        let first = get().await?;
+        assert_eq!(0, **first.object());
+        first.release();
+
+        let second = get().await?;
+        assert_eq!(0, **second.object());
+        drop(second);
+
+        assert_eq!(vec![0], *abandoned.lock().expect("abandoned"));
+        assert_eq!(0, pool.status().size);
+
+        let third = get().await?;
+        assert_eq!(1, **third.object());
+        third.release();
+
+        assert_eq!(vec![0], *abandoned.lock().expect("abandoned"));
 
         Ok(())
     }

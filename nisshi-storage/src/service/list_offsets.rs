@@ -21,8 +21,8 @@ use nisshi_sans_io::{
     list_offsets_response::{ListOffsetsPartitionResponse, ListOffsetsTopicResponse},
 };
 use rama::Service;
-use tokio::time::Instant;
-use tracing::{debug, error, instrument};
+use tokio::{sync::Semaphore, time::Instant};
+use tracing::{debug, error, instrument, warn};
 
 use crate::{
     Error, ListOffsetResponse, Result, Storage, Topition,
@@ -30,10 +30,21 @@ use crate::{
 };
 
 /// How many partitions of one ListOffsets request are read from storage at
-/// once. Each read may hold a pooled database connection (16 for
-/// PostgreSQL), and a read abandoned at the deadline can keep its
-/// connection busy until the server finishes the statement.
+/// once.
 const LIST_OFFSETS_CONCURRENCY: usize = 4;
+
+/// How many partition reads all ListOffsets requests together have in
+/// storage at once.
+///
+/// Each read may hold a pooled database connection until it finishes or
+/// the deadline drops it. This limit is half the PostgreSQL pool of 16, so
+/// ListOffsets requests leave at least 8 connections for other requests.
+const LIST_OFFSETS_SHARED_CONCURRENCY: usize = 8;
+
+static LIST_OFFSETS_READS: Semaphore = Semaphore::const_new(LIST_OFFSETS_SHARED_CONCURRENCY);
+
+/// How many timed-out partitions the deadline warning names.
+const TIMED_OUT_SAMPLE: usize = 8;
 
 /// A [`Service`] using its [`Storage`] taking [`ListOffsetsRequest`] returning [`ListOffsetsResponse`].
 /// ```no_run
@@ -126,7 +137,8 @@ where
         isolation_level: IsolationLevel,
         offsets: &[(Topition, ListOffset)],
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
-        let deadline = Instant::now() + LIST_OFFSETS_READ_DEADLINE;
+        let started_at = Instant::now();
+        let deadline = started_at + LIST_OFFSETS_READ_DEADLINE;
 
         // The reads are built up front (but not started) rather than in a
         // `StreamExt::map` closure, whose lifetimes keep `serve` from being `Send`.
@@ -134,12 +146,13 @@ where
             .iter()
             .enumerate()
             .map(|(index, offset)| async move {
-                let answer = within(
-                    "list_offsets",
-                    deadline,
+                let answer = within("list_offsets", deadline, async {
+                    let _permit = LIST_OFFSETS_READS.acquire().await;
+
                     self.storage
-                        .list_offsets(isolation_level, slice::from_ref(offset)),
-                )
+                        .list_offsets(isolation_level, slice::from_ref(offset))
+                        .await
+                })
                 .await;
 
                 (index, offset, answer)
@@ -149,13 +162,14 @@ where
         let mut answers = stream::iter(reads).buffer_unordered(LIST_OFFSETS_CONCURRENCY);
 
         let mut responses = vec![Vec::new(); offsets.len()];
+        let mut timed_out = Vec::new();
 
         while let Some((index, (topition, _), answer)) = answers.next().await {
             responses[index] = match answer {
                 Some(answer) => answer?,
 
                 None => {
-                    debug!(?topition, "storage read past the deadline");
+                    timed_out.push(topition);
 
                     vec![(
                         topition.clone(),
@@ -167,6 +181,17 @@ where
                     )]
                 }
             };
+        }
+
+        if !timed_out.is_empty() {
+            warn!(
+                deadline = ?LIST_OFFSETS_READ_DEADLINE,
+                elapsed = ?started_at.elapsed(),
+                timed_out = timed_out.len(),
+                partitions = offsets.len(),
+                sample = ?&timed_out[..timed_out.len().min(TIMED_OUT_SAMPLE)],
+                "list offsets answered REQUEST_TIMED_OUT for partitions unread at the deadline"
+            );
         }
 
         Ok(responses.into_iter().flatten().collect())

@@ -35,6 +35,15 @@ use tokio::time::{Duration, Instant, timeout_at};
 use crate::METER;
 
 /// How long ListOffsets may spend in storage, under franz-go's flat 10s.
+///
+/// A partition still unread at this deadline answers `REQUEST_TIMED_OUT`
+/// with offset and timestamp -1. Kafka 4.0 sends the same answer for a
+/// partition whose remote-storage lookup expires in its list-offsets
+/// purgatory ([DelayedRemoteListOffsets.scala#L46], [#L144-L149]), so
+/// clients already retry it.
+///
+/// [DelayedRemoteListOffsets.scala#L46]: https://github.com/apache/kafka/blob/4.0.0/core/src/main/scala/kafka/server/DelayedRemoteListOffsets.scala#L46
+/// [#L144-L149]: https://github.com/apache/kafka/blob/4.0.0/core/src/main/scala/kafka/server/DelayedRemoteListOffsets.scala#L144-L149
 pub(crate) const LIST_OFFSETS_READ_DEADLINE: Duration = Duration::from_secs(5);
 
 static READ_DEADLINE_EXCEEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
@@ -61,6 +70,19 @@ pub(crate) async fn within<F>(
 where
     F: Future,
 {
+    within_counting(&READ_DEADLINE_EXCEEDED, operation, deadline, read).await
+}
+
+/// Runs [`within`], counting each abandoned read in `exceeded`.
+async fn within_counting<F>(
+    exceeded: &Counter<u64>,
+    operation: &'static str,
+    deadline: Instant,
+    read: F,
+) -> Option<F::Output>
+where
+    F: Future,
+{
     let outcome = if Instant::now() >= deadline {
         None
     } else {
@@ -68,7 +90,7 @@ where
     };
 
     if outcome.is_none() {
-        READ_DEADLINE_EXCEEDED.add(1, &[KeyValue::new("operation", operation)]);
+        exceeded.add(1, &[KeyValue::new("operation", operation)]);
     }
 
     outcome
@@ -82,6 +104,12 @@ mod tests {
             Arc,
             atomic::{AtomicBool, Ordering},
         },
+    };
+
+    use opentelemetry::metrics::MeterProvider as _;
+    use opentelemetry_sdk::metrics::{
+        InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+        data::{AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics, SumDataPoint},
     };
 
     use super::*;
@@ -116,5 +144,65 @@ mod tests {
 
         assert_eq!(None, within("test", deadline, read).await);
         assert!(!polled.load(Ordering::SeqCst));
+    }
+
+    /// Sums the `nisshi_storage_read_deadline_exceeded` counter for `operation`.
+    fn exceeded(exporter: &InMemoryMetricExporter, operation: &str) -> u64 {
+        exporter
+            .get_finished_metrics()
+            .expect("finished metrics")
+            .iter()
+            .flat_map(ResourceMetrics::scope_metrics)
+            .flat_map(ScopeMetrics::metrics)
+            .filter(|metric| metric.name() == "nisshi_storage_read_deadline_exceeded")
+            .filter_map(|metric| match metric.data() {
+                AggregatedMetrics::U64(MetricData::Sum(sum)) => Some(
+                    sum.data_points()
+                        .filter(|point| {
+                            point.attributes().any(|attribute| {
+                                attribute.key.as_str() == "operation"
+                                    && attribute.value.as_str() == operation
+                            })
+                        })
+                        .map(SumDataPoint::value)
+                        .sum::<u64>(),
+                ),
+                _ => None,
+            })
+            .sum()
+    }
+
+    /// Each abandoned read adds one to the counter, and a read that finishes
+    /// in time adds nothing.
+    #[tokio::test(start_paused = true)]
+    async fn counts_each_abandoned_read() {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .build();
+        let counter = provider
+            .meter("test")
+            .u64_counter("nisshi_storage_read_deadline_exceeded")
+            .build();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        assert_eq!(
+            Some(7),
+            within_counting(&counter, "on_time", deadline, async { 7 }).await
+        );
+        assert_eq!(
+            None,
+            within_counting(&counter, "stalled", deadline, pending::<()>()).await
+        );
+        assert_eq!(
+            None,
+            within_counting(&counter, "stalled", deadline, async {}).await
+        );
+
+        provider.force_flush().expect("flush");
+
+        assert_eq!(0, exceeded(&exporter, "on_time"));
+        assert_eq!(2, exceeded(&exporter, "stalled"));
     }
 }
